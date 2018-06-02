@@ -6,124 +6,144 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 class deepFM(BaseEstimator, TransformerMixin):
-    def __init__(self, args):
-    """
-        feature_size,
-        field_size,
-        embedding_dim,
-        dropout_fm=[1.0, 1.0],
-        deep_layers=[32, 32],
-        dropout_deep=[0.5, 0.5, 0.5],
-        epoch=10,
-        batch_size=256,
-        learning_rate=0.1,
-        optimizer='Adam',
-        batch_norm=0,
-        batch_norm_decay=0.995,
-        verbose=False,
-        random_seed=2016,
-        loss_type='mse',
-        l2_regularization=0.0)
-    """
-
-        self.args = args
+    def __init__(self, feature_size, exist_feature_size, embedding_dim,
+                 dropout_fm=[1.0, 1.0], deep_layers=[64, 64], dropout_deep=[0.5, 0.5, 0.5],
+                 epoch=10, batch_size=1, learning_rate=0.1, optimizer='SGD', batch_norm=0,
+                 batch_norm_decay=0.995, verbose=False, random_seed=2016, loss_type='mse', l2_regularization=0.0):
 
         # check parameters
-        assert self.args.loss_type in ["logloss", "mse"], "loss_type can be either 'logloss' for classification task or 'mse' for regression task"
+        assert loss_type in ["logloss", "mse"], "loss_type can be either 'logloss' for classification task or 'mse' for regression task"
 
+        self.feature_size = feature_size
+        self.exist_feature_size = exist_feature_size
+        self.embedding_dim = embedding_dim
+
+        self.dropout_fm = dropout_fm
+        self.deep_layers = deep_layers
+        self.dropout_deep = dropout_deep
+
+        self.epoch = epoch
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.optimizer = optimizer
+
+        self.batch_norm = batch_norm
+        self.batch_norm_decay = batch_norm_decay
+
+        self.verbose = verbose
+        self.random_seed = random_seed
+        self.loss_type = loss_type
+        self.l2_regularization = l2_regularization
+
+        self._init_graph()
+
+    def _init_graph(self):
         self.graph = tf.Graph()
-        with self.graph.as_defalut():
-            self.feature_index = tf.placeholder(tf.int32, shape=[None, None], name='feature_index') # batch * feature_size
-            self.feature_value = tf.placeholder(tf.float32, shape=[None, None], name='feature_value')
-            self.label = tf.placeholder(tf.float32, shape=[None, 1], name='label')
-            self.droupout_keep_fm = tf.placeholder(tf.float32, shape=[None], name='droupout_keep_fm')
-            self.droupout_keep_deep = tf.placeholder(tf.float32, shape=[None], name='droupout_keep_deep')
-            self.train_phase = tf.placeholder(tf.bool, name='train_phase')
+        with self.graph.as_default():
+            tf.set_random_seed(self.random_seed)
+            self.feature_index_ = tf.placeholder(tf.int32, shape=[None, None], name='feature_index')  # batch * exist_feature_size
+            self.feature_value_ = tf.placeholder(tf.float32, shape=[None, None], name='feature_value')  # batch * exist_feature_size
+            self.label_ = tf.placeholder(tf.float32, shape=[None, 1], name='label')
+            self.dropout_keep_fm_ = tf.placeholder(tf.float32, shape=[None], name='dropout_keep_fm')
+            self.dropout_keep_deep_ = tf.placeholder(tf.float32, shape=[None], name='dropout_keep_deep')
+            # ????? what's this ? --->
+            self.train_phase_ = tf.placeholder(tf.bool, name='train_phase')
+
             self.weights = self._initialize_weights()
 
             # FM-model
             # ---------- first order term -------------
-            self.y_first_order = tf.nn.embedding_lookup(self.weights['FM_W'], self.feature_index) # None * feature_size * 1
-            self.y_first_order = tf.reduce_sum(tf.multiply(self.y_first_order, feature_value), 1) # None * feature_size
-            self.y_first_order = tf.nn.dropout(self.y_first_order, self.droupout_keep_fm[0])
+            self.y_first_order = tf.nn.embedding_lookup(self.weights['FM_W'], self.feature_index_)  # batch_size * each_exist_feature_size * 1
+            self.y_first_order = tf.reduce_sum(tf.multiply(self.y_first_order, self.feature_value_), 2)  # batch_size * exist_feature_size
+            self.y_first_order = tf.nn.dropout(self.y_first_order, self.dropout_keep_fm_[0])  # batch_size * exist_feature_size
 
             # ---------- second order term -------------
-            self.embeddings = tf.nn.embedding_lookup(self.weights['feature_embeddings'], self.feature_index) # None * feature_size * embedding_size
-            #>>> feature_value != field_size >>>> ##############
-            feature_value = tf.reshape(self.feature_value, shape=[-1, self.args.field_size, 1])
-            self.embeddings = tf.multiply(self.embeddings, feature_value)
+            self.embeddings = tf.nn.embedding_lookup(self.weights['feature_embedding'], self.feature_index_)  # batch_size * exist_feature_size * embedding_dim
+            feature_value = tf.reshape(self.feature_value_, shape=[-1, self.exist_feature_size, 1])
+            self.embeddings = tf.multiply(self.embeddings, feature_value)  # batch_size * feature_size * embedding_dim
 
             # sum_square part
-            self.summed_features_emb = tf.reduce_sum(self.embeddings, 1)
+            self.summed_features_emb = tf.reduce_sum(self.embeddings, 1)  # batch_size * embedding_dim
             self.summed_features_emb_square = tf.square(self.summed_features_emb)
 
             # square_sum part
             self.squared_features_emb = tf.square(self.embeddings)
-            self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)
+            self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)  # batch_size * embedding_dim
 
-            # second order
-            self.y_second_order = 0.5 * tf.subtract(self.summed_features_emb_square, self.squared_sum_features_emb)
-            self.y_second_order = tf.nn.dropout(self.y_second_order, self.droupout_keep_fm[1])
+            self.y_second_order = 0.5 * tf.subtract(self.summed_features_emb_square, self.squared_sum_features_emb)  # batch_size * embedding_dim
+            self.y_second_order = tf.nn.dropout(self.y_second_order, self.dropout_keep_fm_[1])
 
-
-            # ---------- deep component -------------
-            self.y_deep = tf.reshape(self.embeddings, shape=[-1, self.args.field_size * self.args.embedding_size])
-            self.y_deep = tf.nn.dropout(self.y_deep, droupout_keep_deep[0])
-            for i in range(len(self.args.deep_layers)):
+            # deep-model
+            self.y_deep = tf.reshape(self.embeddings, shape=[-1, self.exist_feature_size * self.embedding_dim])
+            self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep_[0])
+            for i in range(len(self.deep_layers)):
                 self.y_deep = tf.add(tf.matmul(self.y_deep, self.weights['layer_%d' % i]), self.weights['bias_%d' % i])
-                if self.args.batch_norm:
+                if self.batch_norm:
                     pass
 #                    self.y_deep = self.batch_norm_layer(self.y_deep, train_phase=self.train_phase, scope_bn='bn_%d' % i)
                 self.y_deep = tf.nn.relu(self.y_deep)
-                self.y_deep = tf.nn.dropout(self.y_deep, self.droupout_keep_deep[1 + i])
+                self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep_[1 + i])
 
-            if self.args.which_model == 'DeepFM':
-                concat_input = tf.concat([self.y_first_order, self.y_second_order, self.y_deep], axis=1)
+            concat_input = tf.concat([self.y_first_order, self.y_second_order, self.y_deep], axis=1)
             self.out = tf.add(tf.matmul(concat_input, self.weights['concat_projection']), self.weights['concat_bias'])
 
             # loss
-            if self.args.loss_type = 'mse':
-                self.loss = tf.nn.l2_loss(tf.subract(self.label, self.out))
+            if self.loss_type == 'mse':
+                self.loss = tf.nn.l2_loss(tf.subtract(self.label_, self.out))
             # l2 regularization on weights
-            if self.args.l2_regularization > 0:
+            if self.l2_regularization > 0:
                 self.loss += tf.contrib.layers.l2_regularizer(self.l2_regularization)(self.weights['concat_projection'])
-                for i in range(len(self.args.deep_layers)):
+                for i in range(len(self.deep_layers)):
                     self.loss += tf.contrib.layers.l2_regularizer(self.l2_regularization)(self.weights['layer_%d' % i])
 
             # optimizer
-            if self.args.optimizer == 'Adam':
-                self.optimizer = tf.train.AdamOptimizer(self.args.learning_rate, beta1=0.9, beta2=0.999, epsilon=1e-8).minimize(self.loss)
-
+            if self.optimizer == 'Adam':
+                self.optimizer = tf.train.AdamOptimizer(self.learning_rate, beta1=0.9, beta2=0.999, epsilon=1e-8).minimize(self.loss)
+            elif self.optimizer == 'SGD':
+                self.optimizer = tf.train.GradientDescentOptimizer(self.learning_rate).minimize(self.loss)
 
             # init
             self.saver = tf.train.Saver()
-            with tf.Session() as sess:
-                sess.run(tf.global_variables_initializer())
+            self.sess = tf.Session()
+            self.sess.run(tf.global_variables_initializer())
 
     def _initialize_weights(self):
         weights = dict()
 
-        # embedding
-        weights['FM_B'] = tf.get_variable(name='FM_B', shape=[1], initializer=tf.constant_initializer(0.0))
-        weights['FM_W'] = tf.get_variable(name='FM_W', shape=[self.args.feature], initializer=tf.glorot_normal_initializer())
-        weights['feature_embedding'] = tf.get_variable(name='feature_embedding', shape=[self.args.feature_size, self.args.embedding_size], initializer=tf.glorot_normal_initializer())
+        # FM-weights
+        weights['FM_W'] = tf.get_variable(name='FM_W', shape=[self.feature_size, 1], initializer=tf.glorot_normal_initializer())
+        weights['feature_embedding'] = tf.get_variable(name='feature_embedding', shape=[self.feature_size, self.embedding_dim], initializer=tf.glorot_normal_initializer())
 
         # deep layers
-        num_layers = len(self.args.deep_layers)
-        input_size = self.args.field_size * self.args.embedding_size
-        glorot = np.sqrt(2.0 / (input_size + self.args.deep_layers[0])
-        weights['layer_0'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(input_size, self.args.deep_layers[0])), dtype=np.float32)
-        weights['bias_0'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(1, self.args.deep_layers[0])), dtype=np.float32)
+        num_layers = len(self.deep_layers)
+        input_size = self.exist_feature_size * self.embedding_dim
+        weights['layer_0'] = tf.get_variable(name='layer_0', shape=[input_size, self.deep_layers[0]], initializer=tf.glorot_normal_initializer())
+        weights['bias_0'] = tf.get_variable(name='bias_0', shape=[1, self.deep_layers[0]], initializer=tf.glorot_normal_initializer())
 
-        for i in range(1, num_layer):
-            glorot = np.sqrt(2.0 / (self.args.deep_layers[i-1] + self.args.deep_layers[i])
-            weights['layer_%d' % i] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(self.args.deep_layers[i-1], self.args.deep_layers[i])), dtype=np.float32)
-            weights['bias_%d' % i] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(1, self.args.deep_layers[i])), dtype=np.float32)
+        for i in range(1, num_layers):
+            weights['layer_%d' % i] = tf.get_variable(name='layer_%d' % i, shape=[self.deep_layers[i - 1], self.deep_layers[i]], initializer=tf.glorot_normal_initializer())
+            weights['bias_%d' % i] = tf.get_variable(name='bias_%d' % i, shape=[1, self.deep_layers[i]], initializer=tf.glorot_normal_initializer())
 
-        if self.args.which_model == 'DeepFM':
-            input_size = self.args.field_size + self.args.embedding_size + self.args.deep_layers[-1]
-        glorot = np.sqrt(2.0 / (input_size + 1))
-        weights['concat_projection'] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(input_size, 1)), dtype=np.float32)
-        weights['concat_bias'] = tf.Variable(tf.constant(0.01), dtype=float32)
+        input_size = self.exist_feature_size + self.embedding_dim + self.deep_layers[-1]
+        weights['concat_projection'] = tf.get_variable(name='concat_projection', shape=[input_size, 1], initializer=tf.glorot_normal_initializer())
+        weights['concat_bias'] = tf.Variable(tf.constant(0.01), dtype=np.float32)
 
         return weights
+
+    def fit_on_batch(self, Xi, Xv, y):
+        feed_dict = {self.feature_index_: Xi,
+                     self.feature_value_: Xv,
+                     self.label_: y,
+                     self.dropout_keep_fm_: self.dropout_fm,
+                     self.dropout_keep_deep_: self.dropout_deep,
+                     self.train_phase_: True}
+        loss, opt = self.sess.run((self.loss, self.optimizer), feed_dict=feed_dict)
+        return loss
+
+
+if __name__ == '__main__':
+    model = deepFM(feature_size=10, exist_feature_size=3, embedding_dim=2)
+    Xi = np.array([[1, 4, 7]])
+    Xv = np.array([[1, 1, 1]])
+    y = np.array([[1], [0], [1]])
+    print(model.fit_on_batch(Xi, Xv, y))
