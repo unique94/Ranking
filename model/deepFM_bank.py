@@ -6,17 +6,16 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 class deepFM(BaseEstimator, TransformerMixin):
-    def __init__(self, feature_size, field_size, embedding_dim,
+    def __init__(self, feature_size, exist_feature_size, embedding_dim,
                  dropout_fm=[1.0, 1.0], deep_layers=[64, 64], dropout_deep=[0.5, 0.5, 0.5],
                  epoch=10, batch_size=1, learning_rate=0.1, optimizer='SGD', batch_norm=0,
-                 batch_norm_decay=0.995, verbose=False, random_seed=2016, loss_type='mse', l2_regularization=0.0):
+                 batch_norm_decay=0.995, verbose=False, random_seed=2018, loss_type='mse', l2_regularization=0.0):
 
         # check parameters
         assert loss_type in ["logloss", "mse"], "loss_type can be either 'logloss' for classification task or 'mse' for regression task"
 
         self.feature_size = feature_size
-        # ##################filed size
-        self.field_size = field_size
+        self.exist_feature_size = exist_feature_size
         self.embedding_dim = embedding_dim
 
         self.dropout_fm = dropout_fm
@@ -75,27 +74,40 @@ class deepFM(BaseEstimator, TransformerMixin):
             self.y_second_order = tf.nn.dropout(self.y_second_order, self.dropout_keep_fm_[1])
 
             # deep-model
-            self.y_deep = tf.reshape(self.embeddings, shape=[-1, self.exist_feature_size * self.embedding_dim])
-            self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep_[0])
-            for i in range(len(self.deep_layers)):
-                self.y_deep = tf.add(tf.matmul(self.y_deep, self.weights['layer_%d' % i]), self.weights['bias_%d' % i])
-                if self.batch_norm:
-                    pass
-#                    self.y_deep = self.batch_norm_layer(self.y_deep, train_phase=self.train_phase, scope_bn='bn_%d' % i)
-                self.y_deep = tf.nn.relu(self.y_deep)
-                self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep_[1 + i])
+            self.deep_input = tf.reshape(self.embeddings, shape=[-1, self.exist_feature_size * self.embedding_dim])
+            self.deep_input_dropout = tf.nn.dropout(self.deep_input, self.dropout_keep_deep_[0])
+            layer1 = tf.layer.dense(
+                inputs=self.deep_input_dropout,
+                units=self.deep_layers[0],
+                activation=tf.nn.relu,
+                kernel_initializer=tf.glorot_normal_initializer(),
+                kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.l2_regularization),
+                name='deep_layer1'
+            )
+            layer1_drop = tf.layers.dropout(
+                layer1,
+                rate=self.dropout_keep_deep_[1]
+            )
+            layer2 = tf.layer.dense(
+                inputs=layer1_drop,
+                units=self.deep_layers[1],
+                activation=tf.nn.relu,
+                kernel_initializer=tf.glorot_normal_initializer(),
+                activity_regularizer=tf.contrib.layers.l2_regularizer(scale=self.l2_regularization),
+                name='deep_layer2'
+            )
+            layer2_drop = tf.layers.dropout(
+                layer2,
+                rate=self.dropout_keep_deep_[2]
+            )
 
-            concat_input = tf.concat([self.y_first_order, self.y_second_order, self.y_deep], axis=1)
-            self.out = tf.add(tf.matmul(concat_input, self.weights['concat_projection']), self.weights['concat_bias'])
+            full_connect_layer = tf.layer.dense(
+
+            )
 
             # loss
             if self.loss_type == 'mse':
-                self.loss = tf.nn.l2_loss(tf.subtract(self.label_, self.out))
-            # l2 regularization on weights
-            if self.l2_regularization > 0:
-                self.loss += tf.contrib.layers.l2_regularizer(self.l2_regularization)(self.weights['concat_projection'])
-                for i in range(len(self.deep_layers)):
-                    self.loss += tf.contrib.layers.l2_regularizer(self.l2_regularization)(self.weights['layer_%d' % i])
+                self.loss = tf.nn.l2_loss(tf.subtract(self.label_, self.out)) + tf.losses.get_regularization_loss()
 
             # optimizer
             if self.optimizer == 'Adam':
@@ -131,7 +143,7 @@ class deepFM(BaseEstimator, TransformerMixin):
 
         return weights
 
-    def fit_one_batch(self, Xi, Xv, y):
+    def fit_on_batch(self, Xi, Xv, y):
         feed_dict = {self.feature_index_: Xi,
                      self.feature_value_: Xv,
                      self.label_: y,
@@ -147,4 +159,4 @@ if __name__ == '__main__':
     Xi = np.array([[1, 4, 7]])
     Xv = np.array([[1, 1, 1]])
     y = np.array([[1], [0], [1]])
-    print(model.fit_one_batch(Xi, Xv, y))
+    print(model.fit_on_batch(Xi, Xv, y))
